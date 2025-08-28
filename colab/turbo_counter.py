@@ -22,6 +22,7 @@ import torch
 from tqdm import tqdm
 from ultralytics import YOLO
 from torchvision import models, transforms as T
+import tempfile
 
 
 def select_device_prefer_cuda() -> str:
@@ -191,6 +192,16 @@ def run(args):
     if args.progress:
         pbar = tqdm(total=max(1, total_frames), desc="processing", unit="f")
 
+    def _atomic_write_csv(path: str, rows):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path), encoding="utf-8", newline="") as tf:
+            tmp = tf.name
+            w = csv.writer(tf)
+            for row in rows:
+                w.writerow(row)
+        os.replace(tmp, path)
+
+    last_autosave = time.time()
     for r in stream:
         frame_idx += 1
         # 進捗表示
@@ -243,6 +254,16 @@ def run(args):
                     except Exception:
                         pass
 
+        # 逐次保存
+        if args.autosave_sec > 0 and (now - last_autosave) >= float(args.autosave_sec):
+            first_path = os.path.join(args.outdir, "first_seen.csv")
+            rows = [["camera_id", "track_id", "first_ts"]]
+            for tid in sorted(first_seen.keys()):
+                rows.append([args.cam_id, tid, first_seen[tid]])
+            _atomic_write_csv(first_path, rows)
+            print("[AUTO-SAVE]", first_path)
+            last_autosave = now
+
     if pbar is not None:
         try:
             pbar.close()
@@ -251,11 +272,10 @@ def run(args):
 
     # 保存
     first_path = os.path.join(args.outdir, "first_seen.csv")
-    with open(first_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["camera_id", "track_id", "first_ts"])
-        for tid in sorted(first_seen.keys()):
-            w.writerow([args.cam_id, tid, first_seen[tid]])
+    rows = [["camera_id", "track_id", "first_ts"]]
+    for tid in sorted(first_seen.keys()):
+        rows.append([args.cam_id, tid, first_seen[tid]])
+    _atomic_write_csv(first_path, rows)
     print("[SAVE]", first_path)
 
     if args.save_embeddings and embedder is not None and len(embs) > 0:
@@ -276,6 +296,7 @@ def main():
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--progress", action="store_true")
     ap.add_argument("--progress-sec", type=float, default=2.0)
+    ap.add_argument("--autosave-sec", type=float, default=0.0, help="逐次保存の秒間隔（0で無効）")
     # 同一人物統合モードと重み
     ap.add_argument("--alias-mode", default="multi", choices=["multi", "embed", "none"], help="同一人物推定の手がかりモード")
     ap.add_argument("--alias-threshold", type=float, default=0.92, help="統合の類似度しきい値（0-1）")
