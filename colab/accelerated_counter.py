@@ -251,6 +251,21 @@ def run_tracking(args):
                 ts = iso_ts(base_ts, frame_idx, fps)
                 first_seen[tid] = ts
 
+        # プレビュー表示
+        if args.preview and (frame_idx % int(args.preview_step) == 0):
+            try:
+                img = r.orig_img.copy()
+                for tid, x1, y1, x2, y2 in boxes:
+                    color = (0, 255, 0) if tid is not None else (255, 255, 0)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                    if tid is not None:
+                        cv2.putText(img, f"ID:{tid}", (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.imshow("preview", img)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    pass
+            except Exception:
+                pass
+
     if pbar is not None:
         try:
             pbar.close()
@@ -329,7 +344,7 @@ def run_batched_predict(args):
             for fr in batch_frames:
                 results += model.predict(fr, imgsz=int(args.imgsz), conf=float(args.conf), max_det=int(args.max_det), device=device, verbose=False)
 
-        for idx_val, res in zip(batch_idx, results):
+        for i, (idx_val, res) in enumerate(zip(batch_idx, results)):
             boxes = []
             if res.boxes is not None and len(res.boxes) > 0:
                 xyxy = res.boxes.xyxy.cpu().numpy()
@@ -342,6 +357,18 @@ def run_batched_predict(args):
                 if tid not in first_seen:
                     ts = iso_ts(base_ts, idx_val, prefetch.fps)
                     first_seen[tid] = ts
+
+            # プレビュー表示
+            if args.preview and (idx_val % int(args.preview_step) == 0):
+                try:
+                    img = batch_frames[i].copy()
+                    for (x1, y1, x2, y2) in boxes:
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                    cv2.imshow("preview", img)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        pass
+                except Exception:
+                    pass
 
         batch_frames = []
         batch_idx = []
@@ -402,6 +429,8 @@ def main():
     ap.add_argument("--progress-sec", type=float, default=2.0)
     ap.add_argument("--autosave-sec", type=float, default=60.0)
     ap.add_argument("--no-tracking", action="store_true", help="トラッキングを無効化しバッチ推論に切替")
+    ap.add_argument("--preview", action="store_true", help="ローカル環境でimshowプレビューを有効化")
+    ap.add_argument("--preview-step", type=int, default=30, help="何フレーム毎にプレビューを表示するか")
     args = ap.parse_args()
 
     global parser
