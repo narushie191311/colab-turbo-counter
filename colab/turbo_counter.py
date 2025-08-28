@@ -97,11 +97,79 @@ def run(args):
 
     # Embedding
     embedder = None
-    if args.save_embeddings:
+    if args.alias_mode in ("multi", "embed") or args.save_embeddings:
         embedder = SimpleEmbedder(device="cuda" if torch.cuda.is_available() else "cpu")
 
-    first_seen = {}  # tid -> ts string
-    embs = {}        # key -> vector
+    first_seen = {}  # canonical_tid -> ts string
+    embs = {}        # key -> vector (for saving)
+    alias = {}       # tid -> canonical_tid
+
+    # マルチ手がかり用に保持（canonical_tid -> features）
+    canon_embed = {}   # canonical_tid -> np.ndarray (L2 normalized)
+    canon_color = {}   # canonical_tid -> np.ndarray (L2 normalized HSV hist)
+    canon_height = {}  # canonical_tid -> float (0-1)
+
+    def canonical_tid(tid: int) -> int:
+        cur = tid
+        visited = set()
+        while cur in alias and cur not in visited:
+            visited.add(cur)
+            cur = alias[cur]
+        return cur
+
+    def compute_color_hist(bgr: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        h_hist = cv2.calcHist([hsv], [0], None, [32], [0, 180])
+        s_hist = cv2.calcHist([hsv], [1], None, [16], [0, 256])
+        v_hist = cv2.calcHist([hsv], [2], None, [8], [0, 256])
+        vec = np.concatenate([h_hist.flatten(), s_hist.flatten(), v_hist.flatten()]).astype(np.float32)
+        n = np.linalg.norm(vec) + 1e-9
+        return (vec / n).astype(np.float32)
+
+    def sim_cos(a: np.ndarray, b: np.ndarray) -> float:
+        if a is None or b is None:
+            return 0.0
+        return float(np.dot(a, b))
+
+    def sim_height(h1: float, h2: float) -> float:
+        d = abs(h1 - h2)
+        return float(max(0.0, 1.0 - d))
+
+    def maybe_alias(new_tid: int, roi_img: np.ndarray, box_h_norm: float) -> int:
+        # 特徴作成
+        vec = None
+        if embedder is not None:
+            try:
+                vec = embedder.embed(roi_img)
+            except Exception:
+                vec = None
+        ch = None
+        try:
+            ch = compute_color_hist(roi_img)
+        except Exception:
+            ch = None
+
+        # 類似探索
+        best_sim = -1.0
+        best_can = None
+        for can_id in canon_height.keys() | canon_embed.keys() | canon_color.keys():
+            se = sim_cos(vec, canon_embed.get(can_id)) if vec is not None and canon_embed.get(can_id) is not None else 0.0
+            sc = sim_cos(ch, canon_color.get(can_id)) if ch is not None and canon_color.get(can_id) is not None else 0.0
+            sh = sim_height(box_h_norm, canon_height.get(can_id, box_h_norm)) if canon_height.get(can_id) is not None else 0.0
+            sim = float(args.alias_w_embed) * se + float(args.alias_w_color) * sc + float(args.alias_w_height) * sh
+            if sim > best_sim:
+                best_sim = sim
+                best_can = can_id
+
+        if best_sim >= float(args.alias_threshold) and best_can is not None:
+            alias[new_tid] = int(best_can)
+            return int(best_can)
+
+        # 新規canonicalとして登録
+        canon_embed[new_tid] = vec
+        canon_color[new_tid] = ch
+        canon_height[new_tid] = box_h_norm
+        return new_tid
 
     # Ultralyticsストリーム
     stream = model.track(
@@ -147,20 +215,33 @@ def run(args):
                 tid_i = None if tid is None else int(tid)
                 boxes.append((tid_i, int(x1), int(y1), int(x2), int(y2)))
 
-        # 初回観測
+        # 初回観測 + エイリアス（重複削減）
         for tid, x1, y1, x2, y2 in boxes:
             if tid is None:
                 continue
-            if tid not in first_seen:
+            # ROI
+            x1c = max(0, x1); y1c = max(0, y1); x2c = max(x1c+1, x2); y2c = max(y1c+1, y2)
+            roi = r.orig_img[y1c:y2c, x1c:x2c]
+
+            can = tid
+            if roi.size > 0:
+                if args.alias_mode == "none":
+                    can = tid
+                elif args.alias_mode in ("multi", "embed"):
+                    fh = float(y2c - y1c) / max(1.0, r.orig_img.shape[0])
+                    can = maybe_alias(tid, roi, fh)
+                can = canonical_tid(can)
+
+            if can not in first_seen:
                 ts = iso_ts(base_ts, frame_idx, fps)
-                first_seen[tid] = ts
-                if embedder is not None:
-                    # 全身ROIからの簡易Embedding（顔でなくとも重複排除に一定寄与）
-                    x1c = max(0, x1); y1c = max(0, y1); x2c = max(x1c+1, x2); y2c = max(y1c+1, y2)
-                    roi = r.orig_img[y1c:y2c, x1c:x2c]
-                    if roi.size > 0:
+                first_seen[can] = ts
+                # 保存用Embedding（NPZ）
+                if embedder is not None and roi.size > 0:
+                    try:
                         vec = embedder.embed(roi)
-                        embs[f"{args.cam_id}_{tid}"] = vec
+                        embs[f"{args.cam_id}_{can}"] = vec
+                    except Exception:
+                        pass
 
     if pbar is not None:
         try:
@@ -177,7 +258,7 @@ def run(args):
             w.writerow([args.cam_id, tid, first_seen[tid]])
     print("[SAVE]", first_path)
 
-    if embedder is not None and len(embs) > 0:
+    if args.save_embeddings and embedder is not None and len(embs) > 0:
         np.savez(os.path.join(args.outdir, "turbo_embeddings.npz"), **embs)
         print("[SAVE]", os.path.join(args.outdir, "turbo_embeddings.npz"))
 
@@ -195,6 +276,12 @@ def main():
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--progress", action="store_true")
     ap.add_argument("--progress-sec", type=float, default=2.0)
+    # 同一人物統合モードと重み
+    ap.add_argument("--alias-mode", default="multi", choices=["multi", "embed", "none"], help="同一人物推定の手がかりモード")
+    ap.add_argument("--alias-threshold", type=float, default=0.92, help="統合の類似度しきい値（0-1）")
+    ap.add_argument("--alias-w-embed", type=float, default=0.6, help="埋め込み類似の重み")
+    ap.add_argument("--alias-w-color", type=float, default=0.3, help="色ヒスト類似の重み")
+    ap.add_argument("--alias-w-height", type=float, default=0.1, help="身長近似類似の重み")
     ap.add_argument("--save-embeddings", action="store_true")
     args = ap.parse_args()
     run(args)
