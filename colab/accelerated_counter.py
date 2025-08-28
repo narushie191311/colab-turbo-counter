@@ -22,6 +22,8 @@ import argparse
 import threading
 import datetime as dt
 from typing import List, Tuple
+import signal
+import tempfile
 
 import cv2
 import numpy as np
@@ -174,14 +176,23 @@ def maybe_download_model(args):
             print(f"[WARN] download failed: {e}")
 
 
+def _atomic_write_csv(path: str, rows: List[List[object]]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path), encoding="utf-8", newline="") as tf:
+        tmp = tf.name
+        w = csv.writer(tf)
+        for row in rows:
+            w.writerow(row)
+    os.replace(tmp, path)
+
+
 def save_outputs(outdir: str, cam_id: str, first_seen: dict):
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, "first_seen.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["camera_id", "track_id", "first_ts"])
-        for tid in sorted(first_seen.keys()):
-            w.writerow([cam_id, tid, first_seen[tid]])
+    rows = [["camera_id", "track_id", "first_ts"]]
+    for tid in sorted(first_seen.keys()):
+        rows.append([cam_id, tid, first_seen[tid]])
+    _atomic_write_csv(path, rows)
     print("[SAVE]", path)
 
 
@@ -225,9 +236,23 @@ def run_tracking(args):
         verbose=False,
     )
 
+    # シグナルによる中断対応
+    stop_flag = {"stop": False}
+    def _sig_handler(signum, frame):
+        stop_flag["stop"] = True
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(s, _sig_handler)
+        except Exception:
+            pass
+
     frame_idx = 0
-    for r in stream:
-        frame_idx += 1
+    last_autosave = time.time()
+    try:
+        for r in stream:
+            if stop_flag["stop"]:
+                break
+            frame_idx += 1
         now = time.time()
         if args.progress and (now - last_log) >= args.progress_sec:
             pct = 100.0 * frame_idx / max(1, total_frames)
@@ -295,13 +320,18 @@ def run_tracking(args):
             except Exception:
                 pass
 
-    if pbar is not None:
-        try:
-            pbar.close()
-        except Exception:
-            pass
-
-    save_outputs(args.outdir, args.cam_id, first_seen)
+        # 定期オートセーブ
+        if args.autosave_sec > 0 and (time.time() - last_autosave) >= float(args.autosave_sec):
+            save_outputs(args.outdir, args.cam_id, first_seen)
+            last_autosave = time.time()
+    finally:
+        if pbar is not None:
+            try:
+                pbar.close()
+            except Exception:
+                pass
+        # 終了時に確実に保存
+        save_outputs(args.outdir, args.cam_id, first_seen)
 
 
 def run_batched_predict(args):
@@ -428,38 +458,50 @@ def run_batched_predict(args):
         batch_frames = []
         batch_idx = []
 
-    for idx_val, frame in prefetch:
-        batch_idx.append(idx_val)
-        batch_frames.append(frame)
-        if len(batch_frames) >= int(args.batch):
-            flush_batch()
-        # 進捗
-        if args.progress:
-            if pbar is not None:
-                try:
-                    pbar.n = min(idx_val + 1, max(1, prefetch.total_frames))
-                    pbar.refresh()
-                except Exception:
-                    pass
-            now = time.time()
-            if (now - last_log) >= args.progress_sec:
-                pct = 100.0 * (idx_val + 1) / max(1, prefetch.total_frames)
-                print(f"[PROGRESS] {pct:.2f}% unique={len(first_seen)}")
-                last_log = now
-        # autosave
-        if args.autosave_sec > 0 and (time.time() - autosave_last) >= float(args.autosave_sec):
-            save_outputs(args.outdir, args.cam_id, first_seen)
-            autosave_last = time.time()
-
-    flush_batch()
-
-    if pbar is not None:
+    # シグナルによる中断対応
+    stop_flag = {"stop": False}
+    def _sig_handler(signum, frame):
+        stop_flag["stop"] = True
+    for s in (signal.SIGINT, signal.SIGTERM):
         try:
-            pbar.close()
+            signal.signal(s, _sig_handler)
         except Exception:
             pass
 
-    save_outputs(args.outdir, args.cam_id, first_seen)
+    try:
+        for idx_val, frame in prefetch:
+            if stop_flag["stop"]:
+                break
+            batch_idx.append(idx_val)
+            batch_frames.append(frame)
+            if len(batch_frames) >= int(args.batch):
+                flush_batch()
+            # 進捗
+            if args.progress:
+                if pbar is not None:
+                    try:
+                        pbar.n = min(idx_val + 1, max(1, prefetch.total_frames))
+                        pbar.refresh()
+                    except Exception:
+                        pass
+                now = time.time()
+                if (now - last_log) >= args.progress_sec:
+                    pct = 100.0 * (idx_val + 1) / max(1, prefetch.total_frames)
+                    print(f"[PROGRESS] {pct:.2f}% unique={len(first_seen)}")
+                    last_log = now
+            # autosave
+            if args.autosave_sec > 0 and (time.time() - autosave_last) >= float(args.autosave_sec):
+                save_outputs(args.outdir, args.cam_id, first_seen)
+                autosave_last = time.time()
+
+        flush_batch()
+    finally:
+        if pbar is not None:
+            try:
+                pbar.close()
+            except Exception:
+                pass
+        save_outputs(args.outdir, args.cam_id, first_seen)
 
 
 def main():
