@@ -28,6 +28,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from ultralytics import YOLO
+try:
+    from deepface import DeepFace  # オプション
+except Exception:
+    DeepFace = None
 
 
 def select_device_prefer_cuda() -> str:
@@ -244,6 +248,24 @@ def run_tracking(args):
                 tid_i = None if tid is None else int(tid)
                 boxes.append((tid_i, int(x1), int(y1), int(x2), int(y2)))
 
+        # 属性推定（任意）
+        attrs = {}
+        if args.df_interval > 0 and DeepFace is not None and (frame_idx % int(args.df_interval) == 0):
+            for tid, x1, y1, x2, y2 in boxes:
+                try:
+                    roi = r.orig_img[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
+                    if roi.size == 0:
+                        continue
+                    rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                    res = DeepFace.analyze(rgb, actions=["age", "gender"], enforce_detection=False)
+                    if isinstance(res, list) and len(res) > 0:
+                        res = res[0]
+                    age = res.get("age")
+                    gen = res.get("dominant_gender") or res.get("gender")
+                    attrs[tid] = (age, gen)
+                except Exception:
+                    continue
+
         for tid, *_ in boxes:
             if tid is None:
                 continue
@@ -259,7 +281,14 @@ def run_tracking(args):
                     color = (0, 255, 0) if tid is not None else (255, 255, 0)
                     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
                     if tid is not None:
-                        cv2.putText(img, f"ID:{tid}", (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        label = f"ID:{tid}"
+                        if tid in attrs:
+                            age, gen = attrs[tid]
+                            if age is not None:
+                                label += f" age:{int(age)}"
+                            if isinstance(gen, str):
+                                label += f" {gen}"
+                        cv2.putText(img, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.imshow("preview", img)
                 if cv2.waitKey(1) & 0xFF == 27:
                     pass
@@ -362,8 +391,34 @@ def run_batched_predict(args):
             if args.preview and (idx_val % int(args.preview_step) == 0):
                 try:
                     img = batch_frames[i].copy()
+                    attrs = {}
+                    if args.df_interval > 0 and DeepFace is not None:
+                        # プレビュー時は対象フレームでのみ属性取得
+                        for (x1, y1, x2, y2) in boxes:
+                            try:
+                                roi = img[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
+                                if roi.size == 0:
+                                    continue
+                                rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                                res2 = DeepFace.analyze(rgb, actions=["age", "gender"], enforce_detection=False)
+                                if isinstance(res2, list) and len(res2) > 0:
+                                    res2 = res2[0]
+                                age = res2.get("age")
+                                gen = res2.get("dominant_gender") or res2.get("gender")
+                                attrs[(x1,y1,x2,y2)] = (age, gen)
+                            except Exception:
+                                continue
                     for (x1, y1, x2, y2) in boxes:
                         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                        if (x1,y1,x2,y2) in attrs:
+                            age, gen = attrs[(x1,y1,x2,y2)]
+                            label = []
+                            if age is not None:
+                                label.append(f"age:{int(age)}")
+                            if isinstance(gen, str):
+                                label.append(str(gen))
+                            if label:
+                                cv2.putText(img, ", ".join(label), (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,255), 2)
                     cv2.imshow("preview", img)
                     if cv2.waitKey(1) & 0xFF == 27:
                         pass
@@ -429,6 +484,7 @@ def main():
     ap.add_argument("--progress-sec", type=float, default=2.0)
     ap.add_argument("--autosave-sec", type=float, default=60.0)
     ap.add_argument("--no-tracking", action="store_true", help="トラッキングを無効化しバッチ推論に切替")
+    ap.add_argument("--df-interval", type=int, default=0, help="DeepFace属性推定の間隔（0で無効）")
     ap.add_argument("--preview", action="store_true", help="ローカル環境でimshowプレビューを有効化")
     ap.add_argument("--preview-step", type=int, default=30, help="何フレーム毎にプレビューを表示するか")
     args = ap.parse_args()
