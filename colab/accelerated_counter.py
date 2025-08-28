@@ -298,22 +298,23 @@ def run_tracking(args):
                 ts = iso_ts(base_ts, frame_idx, fps)
                 first_seen[tid] = ts
 
-        # プレビュー表示
-        if args.preview and (frame_idx % int(args.preview_step) == 0):
+        # プレビュー表示（毎フレーム更新、ステップ時のみ描画）
+        if args.preview:
             try:
                 img = r.orig_img.copy()
-                for tid, x1, y1, x2, y2 in boxes:
-                    color = (0, 255, 0) if tid is not None else (255, 255, 0)
-                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-                    if tid is not None:
-                        label = f"ID:{tid}"
-                        if tid in attrs:
-                            age, gen = attrs[tid]
-                            if age is not None:
-                                label += f" age:{int(age)}"
-                            if isinstance(gen, str):
-                                label += f" {gen}"
-                        cv2.putText(img, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                if (frame_idx % int(args.preview_step) == 0):
+                    for tid, x1, y1, x2, y2 in boxes:
+                        color = (0, 255, 0) if tid is not None else (255, 255, 0)
+                        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                        if tid is not None:
+                            label = f"ID:{tid}"
+                            if tid in attrs:
+                                age, gen = attrs[tid]
+                                if age is not None:
+                                    label += f" age:{int(age)}"
+                                if isinstance(gen, str):
+                                    label += f" {gen}"
+                            cv2.putText(img, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.imshow("preview", img)
                 if cv2.waitKey(1) & 0xFF == 27:
                     pass
